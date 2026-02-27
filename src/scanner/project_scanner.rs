@@ -3,7 +3,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use tracing::info;
@@ -14,6 +14,7 @@ const MAX_SCAN_DEPTH: usize = 10;
 pub struct ProjectScanner {
     exclude_paths: Vec<String>,
     skip_directories: HashSet<String>,
+    skip_unix_root_directories: HashSet<String>,
     extension_markers: HashSet<String>,
     filename_markers: HashSet<String>,
     project_type_by_extension: HashMap<String, String>,
@@ -81,6 +82,27 @@ impl ProjectScanner {
                 "plugins",
                 "pkg",
                 "flutter",
+            ]),
+            skip_unix_root_directories: set(&[
+                "applications",
+                "cores",
+                "dev",
+                "etc",
+                "lib",
+                "lib64",
+                "library",
+                "lost+found",
+                "private",
+                "proc",
+                "root",
+                "run",
+                "sbin",
+                "snap",
+                "sys",
+                "system",
+                "usr",
+                "var",
+                "volumes",
             ]),
             extension_markers: set(&[".csproj", ".fsproj", ".vbproj", ".sln", ".slnx"]),
             filename_markers: set(&[
@@ -273,7 +295,7 @@ impl ProjectScanner {
             .max_depth(MAX_SCAN_DEPTH)
             .follow_links(false)
             .into_iter()
-            .filter_entry(|entry| self.allow_entry(entry));
+            .filter_entry(|entry| self.allow_entry(root, entry));
 
         for entry in walker.filter_map(|entry| entry.ok()) {
             if !entry.file_type().is_dir() {
@@ -282,7 +304,7 @@ impl ProjectScanner {
 
             directories_scanned.fetch_add(1, Ordering::Relaxed);
             let path = entry.path();
-            if self.should_skip_path(path) {
+            if self.should_skip_path(root, path) {
                 continue;
             }
 
@@ -297,25 +319,30 @@ impl ProjectScanner {
         Ok(self.deduplicate_projects(projects))
     }
 
-    fn allow_entry(&self, entry: &DirEntry) -> bool {
+    fn allow_entry(&self, scan_root: &str, entry: &DirEntry) -> bool {
         let path = entry.path();
-        if self.should_skip_path(path) {
+        if self.should_skip_path(scan_root, path) {
             return false;
         }
 
         match path.file_name() {
             Some(name) => {
                 let lowered = name.to_string_lossy().to_lowercase();
-                !self.skip_directories.contains(&lowered) && !lowered.starts_with('.')
+                !self.skip_directories.contains(&lowered)
+                    && !lowered.starts_with('.')
+                    && !self.should_skip_unix_root_directory(scan_root, path, &lowered)
             }
             None => true,
         }
     }
 
-    fn should_skip_path(&self, path: &Path) -> bool {
+    fn should_skip_path(&self, scan_root: &str, path: &Path) -> bool {
         if let Some(name) = path.file_name() {
             let lowered = name.to_string_lossy().to_lowercase();
-            if self.skip_directories.contains(&lowered) || lowered.starts_with('.') {
+            if self.skip_directories.contains(&lowered)
+                || lowered.starts_with('.')
+                || self.should_skip_unix_root_directory(scan_root, path, &lowered)
+            {
                 return true;
             }
         }
@@ -326,6 +353,17 @@ impl ProjectScanner {
             normalized_path == normalized_exclude
                 || normalized_path.starts_with(&format!("{normalized_exclude}\\"))
         })
+    }
+
+    fn should_skip_unix_root_directory(
+        &self,
+        scan_root: &str,
+        path: &Path,
+        lowered_name: &str,
+    ) -> bool {
+        self.skip_unix_root_directories.contains(lowered_name)
+            && is_unix_filesystem_root(Path::new(scan_root))
+            && path.parent() == Some(Path::new(scan_root))
     }
 
     fn check_for_project(&self, path: &Path) -> Option<ProjectInfo> {
@@ -810,6 +848,11 @@ fn datetime_from_system_time(time: std::time::SystemTime) -> DateTime<Utc> {
     DateTime::<Utc>::from(time)
 }
 
+fn is_unix_filesystem_root(path: &Path) -> bool {
+    let mut components = path.components();
+    matches!(components.next(), Some(Component::RootDir)) && components.next().is_none()
+}
+
 #[cfg(windows)]
 fn get_available_roots() -> Result<Vec<String>> {
     let mut drives = Vec::new();
@@ -883,10 +926,10 @@ fn contains_tag(tags: &[String], needle: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::ProjectScanner;
+    use super::{is_unix_filesystem_root, ProjectScanner};
     use anyhow::Result;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_root(prefix: &str) -> PathBuf {
@@ -931,5 +974,25 @@ mod tests {
 
         fs::remove_dir_all(root)?;
         Ok(())
+    }
+
+    #[test]
+    fn identifies_unix_filesystem_root() {
+        assert!(is_unix_filesystem_root(Path::new("/")));
+        assert!(!is_unix_filesystem_root(Path::new("/Users/dev")));
+    }
+
+    #[test]
+    fn skips_mac_and_linux_system_dirs_only_from_unix_root() {
+        let scanner = ProjectScanner::new(Vec::new());
+
+        assert!(scanner.should_skip_unix_root_directory("/", Path::new("/usr"), "usr"));
+        assert!(scanner.should_skip_unix_root_directory("/", Path::new("/Library"), "library"));
+        assert!(!scanner.should_skip_unix_root_directory(
+            "/Users/dev",
+            Path::new("/Users/dev/Library"),
+            "library"
+        ));
+        assert!(!scanner.should_skip_unix_root_directory("/usr", Path::new("/usr/local"), "local"));
     }
 }
