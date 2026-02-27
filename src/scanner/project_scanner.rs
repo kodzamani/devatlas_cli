@@ -3,11 +3,14 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use tracing::info;
 use walkdir::{DirEntry, WalkDir};
+
+#[cfg(windows)]
+use std::path::PathBuf;
 
 const MAX_SCAN_DEPTH: usize = 10;
 
@@ -82,6 +85,10 @@ impl ProjectScanner {
                 "plugins",
                 "pkg",
                 "flutter",
+                "library",
+                "applications",
+                "xcode",
+                "deriveddata",
             ]),
             skip_unix_root_directories: set(&[
                 "applications",
@@ -106,6 +113,9 @@ impl ProjectScanner {
                 "volumes",
                 "Library",
                 "System",
+                "Applications",
+                "Xcode",
+                "DerivedData",
             ]),
             extension_markers: set(&[".csproj", ".fsproj", ".vbproj", ".sln", ".slnx"]),
             filename_markers: set(&[
@@ -233,6 +243,10 @@ impl ProjectScanner {
         self.scan_roots(vec![path.to_string()], progress_tx).await
     }
 
+    pub fn sanitize_projects(&self, projects: Vec<ProjectInfo>) -> Vec<ProjectInfo> {
+        self.deduplicate_projects(projects)
+    }
+
     async fn scan_roots(
         &self,
         roots: Vec<String>,
@@ -342,7 +356,8 @@ impl ProjectScanner {
     fn should_skip_path(&self, scan_root: &str, path: &Path) -> bool {
         if let Some(name) = path.file_name() {
             let lowered = name.to_string_lossy().to_lowercase();
-            if self.skip_directories.contains(&lowered)
+            if (path.is_dir() && is_skippable_bundle_name(&lowered))
+                || self.skip_directories.contains(&lowered)
                 || lowered.starts_with('.')
                 || self.should_skip_unix_root_directory(scan_root, path, &lowered)
             {
@@ -630,6 +645,10 @@ impl ProjectScanner {
     fn deduplicate_projects(&self, projects: Vec<ProjectInfo>) -> Vec<ProjectInfo> {
         let mut unique_by_path = HashMap::<String, ProjectInfo>::new();
         for project in projects {
+            if is_path_inside_skippable_location(&project.path) {
+                continue;
+            }
+
             let key = normalize_path(&project.path);
             match unique_by_path.get(&key) {
                 Some(existing) if project_priority(existing) >= project_priority(&project) => {}
@@ -774,7 +793,11 @@ fn percent(processed: u32, total: u32) -> f32 {
 }
 
 fn default_exclude_paths() -> Vec<String> {
+    #[cfg(windows)]
     let mut paths = Vec::new();
+
+    #[cfg(not(windows))]
+    let paths = Vec::new();
 
     #[cfg(windows)]
     {
@@ -833,6 +856,33 @@ fn project_priority(project: &ProjectInfo) -> u8 {
         "Rust" | "Go" | "Node.js" | "Python" | "Flutter" => 2,
         _ => 1,
     }
+}
+
+fn is_app_bundle_name(name: &str) -> bool {
+    name.ends_with(".app")
+}
+
+fn is_skippable_scan_directory_name(name: &str) -> bool {
+    matches!(name, "library" | "applications" | "xcode" | "deriveddata")
+}
+
+fn is_xcode_bundle_name(name: &str) -> bool {
+    name.ends_with(".xcodeproj") || name.ends_with(".xcworkspace")
+}
+
+fn is_skippable_bundle_name(name: &str) -> bool {
+    is_app_bundle_name(name) || is_xcode_bundle_name(name)
+}
+
+fn is_skippable_path_component(name: &str) -> bool {
+    is_skippable_scan_directory_name(name) || is_skippable_bundle_name(name)
+}
+
+fn is_path_inside_skippable_location(path: &str) -> bool {
+    Path::new(path)
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .any(|component| is_skippable_path_component(&component.to_lowercase()))
 }
 
 fn should_skip_nested_project(existing: &ProjectInfo, candidate: &ProjectInfo) -> bool {
@@ -963,6 +1013,7 @@ fn contains_tag(tags: &[String], needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{is_unix_filesystem_root, list_directory_roots, ProjectScanner};
+    use crate::models::ProjectInfo;
     use anyhow::Result;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1010,6 +1061,161 @@ mod tests {
 
         fs::remove_dir_all(root)?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn skips_xcode_bundle_directories_during_scan() -> Result<()> {
+        let root = unique_root("devatlas_xcode_project");
+        let project_root = root.join("AiFalApp");
+        let xcodeproj = project_root.join("AiFalApp.xcodeproj");
+        fs::create_dir_all(xcodeproj.join("project.xcworkspace"))?;
+        fs::write(xcodeproj.join("project.pbxproj"), "// !PBXProject")?;
+
+        let scanner = ProjectScanner::new(Vec::new());
+        let projects = scanner.scan_path(&root.to_string_lossy(), None).await?;
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].path, project_root.to_string_lossy());
+        assert_eq!(projects[0].project_type, "iOS");
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn sanitizes_cached_xcode_bundle_entries() {
+        let scanner = ProjectScanner::new(Vec::new());
+        let root = ProjectInfo::new(
+            "/tmp/AiFalApp".to_string(),
+            "AiFalApp".to_string(),
+            "iOS".to_string(),
+        );
+        let bundle = ProjectInfo::new(
+            "/tmp/AiFalApp/AiFalApp.xcodeproj".to_string(),
+            "AiFalApp.xcodeproj".to_string(),
+            "macOS".to_string(),
+        );
+
+        let projects = scanner.sanitize_projects(vec![bundle, root]);
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].path, "/tmp/AiFalApp");
+    }
+
+    #[tokio::test]
+    async fn skips_app_bundle_directories_during_scan() -> Result<()> {
+        let root = unique_root("devatlas_app_bundle");
+        let app_bundle = root.join("Azure Data Studio.app");
+        let nested_project = app_bundle.join("Contents").join("Resources").join("app");
+        fs::create_dir_all(&nested_project)?;
+        fs::write(
+            nested_project.join("package.json"),
+            "{ \"name\": \"embedded-app\" }",
+        )?;
+
+        let scanner = ProjectScanner::new(Vec::new());
+        let projects = scanner.scan_path(&root.to_string_lossy(), None).await?;
+
+        assert!(projects.is_empty());
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn sanitizes_cached_app_bundle_entries() {
+        let scanner = ProjectScanner::new(Vec::new());
+        let bundled = ProjectInfo::new(
+            "/Applications/Azure Data Studio.app/Contents/Resources/app".to_string(),
+            "app".to_string(),
+            "Node.js".to_string(),
+        );
+        let real = ProjectInfo::new(
+            "/tmp/real-project".to_string(),
+            "real-project".to_string(),
+            "Node.js".to_string(),
+        );
+
+        let projects = scanner.sanitize_projects(vec![bundled, real]);
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].path, "/tmp/real-project");
+    }
+
+    #[tokio::test]
+    async fn skips_library_applications_xcode_and_deriveddata_directories_during_scan() -> Result<()>
+    {
+        let root = unique_root("devatlas_skipped_dirs");
+
+        let library_project = root.join("Library").join("HistoryProject");
+        fs::create_dir_all(&library_project)?;
+        fs::write(
+            library_project.join("package.json"),
+            "{ \"name\": \"history-project\" }",
+        )?;
+
+        let applications_project = root.join("Applications").join("EmbeddedWebApp");
+        fs::create_dir_all(&applications_project)?;
+        fs::write(
+            applications_project.join("package.json"),
+            "{ \"name\": \"embedded-web-app\" }",
+        )?;
+
+        let xcode_project = root.join("Xcode").join("SampleSwift");
+        fs::create_dir_all(&xcode_project)?;
+        fs::write(
+            xcode_project.join("Package.swift"),
+            "// swift-tools-version: 5.9",
+        )?;
+
+        let derived_data_project = root
+            .join("Developer")
+            .join("Xcode")
+            .join("DerivedData")
+            .join("CachedApp");
+        fs::create_dir_all(&derived_data_project)?;
+        fs::write(
+            derived_data_project.join("package.json"),
+            "{ \"name\": \"cached-app\" }",
+        )?;
+
+        let scanner = ProjectScanner::new(Vec::new());
+        let projects = scanner.scan_path(&root.to_string_lossy(), None).await?;
+
+        assert!(projects.is_empty());
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn sanitizes_cached_entries_inside_skipped_directories() {
+        let scanner = ProjectScanner::new(Vec::new());
+        let library = ProjectInfo::new(
+            "/Users/aygundev/Library/Application Support/Cursor/User/History/6eba3ab6".to_string(),
+            "6eba3ab6".to_string(),
+            "Python".to_string(),
+        );
+        let applications = ProjectInfo::new(
+            "/Volumes/SSD-AYGUN/Applications/SomeTool".to_string(),
+            "SomeTool".to_string(),
+            "Node.js".to_string(),
+        );
+        let derived_data = ProjectInfo::new(
+            "/Volumes/SSD-AYGUN/Developer/Xcode/DerivedData/CachedApp".to_string(),
+            "CachedApp".to_string(),
+            "Swift".to_string(),
+        );
+        let real = ProjectInfo::new(
+            "/tmp/real-project".to_string(),
+            "real-project".to_string(),
+            "Node.js".to_string(),
+        );
+
+        let projects = scanner.sanitize_projects(vec![library, applications, derived_data, real]);
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].path, "/tmp/real-project");
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use crate::models::{ProjectIndexData, ProjectInfo};
+use crate::scanner::ProjectScanner;
 use crate::settings::{app_dir, ensure_app_dir};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
@@ -36,7 +37,8 @@ impl JsonCache {
     }
 
     pub async fn load_projects(&self) -> Result<Vec<ProjectInfo>> {
-        Ok(self.load_index().await?.projects)
+        let projects = self.load_index().await?.projects;
+        Ok(ProjectScanner::default().sanitize_projects(projects))
     }
 
     pub async fn save_projects(&self, projects: Vec<ProjectInfo>) -> Result<()> {
