@@ -564,15 +564,15 @@ fn rank_project_search_match(
     query: &str,
 ) -> Option<(u8, i64)> {
     if let Some(score) = matcher.fuzzy_match(&project.name, query) {
-        return Some((3, i64::from(score)));
+        return Some((3, score));
     }
 
     if let Some(score) = matcher.fuzzy_match(&project.category, query) {
-        return Some((2, i64::from(score)));
+        return Some((2, score));
     }
 
     if let Some(score) = matcher.fuzzy_match(&project.project_type, query) {
-        return Some((1, i64::from(score)));
+        return Some((1, score));
     }
 
     None
