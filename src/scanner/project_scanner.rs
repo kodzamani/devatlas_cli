@@ -345,6 +345,13 @@ impl ProjectScanner {
         match path.file_name() {
             Some(name) => {
                 let lowered = name.to_string_lossy().to_lowercase();
+                
+                // Special handling for mobile project subdirectories
+                if self.is_mobile_project_subdirectory(&lowered) {
+                    // Allow if not a child of a mobile project, skip otherwise
+                    return !self.is_child_of_mobile_project(path);
+                }
+                
                 !self.skip_directories.contains(&lowered)
                     && !lowered.starts_with('.')
                     && !self.should_skip_unix_root_directory(scan_root, path, &lowered)
@@ -356,6 +363,15 @@ impl ProjectScanner {
     fn should_skip_path(&self, scan_root: &str, path: &Path) -> bool {
         if let Some(name) = path.file_name() {
             let lowered = name.to_string_lossy().to_lowercase();
+            
+            // Check if this is a mobile project subdirectory
+            if self.is_mobile_project_subdirectory(&lowered) {
+                // Skip if the parent directory is a mobile project (Flutter/React Native)
+                if self.is_child_of_mobile_project(path) {
+                    return true;
+                }
+            }
+            
             if (path.is_dir() && is_skippable_bundle_name(&lowered))
                 || self.skip_directories.contains(&lowered)
                 || lowered.starts_with('.')
@@ -382,6 +398,43 @@ impl ProjectScanner {
         self.skip_unix_root_directories.contains(lowered_name)
             && is_unix_filesystem_root(Path::new(scan_root))
             && path.parent() == Some(Path::new(scan_root))
+    }
+
+    /// Check if a directory name is a mobile project subdirectory that should be skipped
+    fn is_mobile_project_subdirectory(&self, name: &str) -> bool {
+        matches!(name, "android" | "ios" | "app" | "pods")
+    }
+
+    /// Check if a path is a child of a mobile project (Flutter/React Native)
+    fn is_child_of_mobile_project(&self, path: &Path) -> bool {
+        // Get the parent directory
+        if let Some(parent) = path.parent() {
+            // Check if the parent directory contains mobile project markers
+            if let Ok(entries) = fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    if let Ok(file_type) = entry.file_type() {
+                        if file_type.is_file() {
+                            let file_name = entry.file_name().to_string_lossy().to_lowercase();
+                            // Check for Flutter or React Native project markers
+                            if file_name == "pubspec.yaml" || file_name == "package.json" {
+                                // For package.json, we need to verify it's actually a React Native project
+                                if file_name == "package.json" {
+                                    if let Ok(content) = fs::read_to_string(entry.path()) {
+                                        if content.to_lowercase().contains("react-native") {
+                                            return true;
+                                        }
+                                    }
+                                } else {
+                                    // pubspec.yaml definitely indicates a Flutter project
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 
     fn check_for_project(&self, path: &Path) -> Option<ProjectInfo> {
