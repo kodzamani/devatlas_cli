@@ -104,6 +104,8 @@ impl ProjectScanner {
                 "usr",
                 "var",
                 "volumes",
+                "Library",
+                "System",
             ]),
             extension_markers: set(&[".csproj", ".fsproj", ".vbproj", ".sln", ".slnx"]),
             filename_markers: set(&[
@@ -866,9 +868,42 @@ fn get_available_roots() -> Result<Vec<String>> {
     Ok(drives)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn get_available_roots() -> Result<Vec<String>> {
+    let mut roots = vec!["/".to_string()];
+    roots.extend(list_directory_roots(Path::new("/Volumes")));
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn get_available_roots() -> Result<Vec<String>> {
     Ok(vec!["/".to_string()])
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn list_directory_roots(root: &Path) -> Vec<String> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut roots = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            entry
+                .file_type()
+                .ok()
+                .filter(|kind| kind.is_dir())
+                .map(|_| path.to_string_lossy().to_string())
+        })
+        .collect::<Vec<_>>();
+
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 fn get_project_icon(project_type: &str, tags: &[String]) -> (String, String) {
@@ -927,7 +962,7 @@ fn contains_tag(tags: &[String], needle: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_unix_filesystem_root, ProjectScanner};
+    use super::{is_unix_filesystem_root, list_directory_roots, ProjectScanner};
     use anyhow::Result;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -995,5 +1030,24 @@ mod tests {
             "library"
         ));
         assert!(!scanner.should_skip_unix_root_directory("/usr", Path::new("/usr/local"), "local"));
+    }
+
+    #[test]
+    fn lists_only_directory_roots() -> Result<()> {
+        let root = unique_root("devatlas_volume_roots");
+        let volume_a = root.join("ExternalSSD");
+        let volume_b = root.join("Backup");
+        fs::create_dir_all(&volume_a)?;
+        fs::create_dir_all(&volume_b)?;
+        fs::write(root.join("readme.txt"), "ignore me")?;
+
+        let roots = list_directory_roots(&root);
+
+        assert_eq!(roots.len(), 2);
+        assert!(roots.iter().any(|path| path.ends_with("ExternalSSD")));
+        assert!(roots.iter().any(|path| path.ends_with("Backup")));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 }
