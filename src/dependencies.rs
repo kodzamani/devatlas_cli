@@ -53,7 +53,7 @@ impl DependencyDetector {
         if let Some(section) = parse_gemfile(&root.join("Gemfile"))? {
             sections.push(section);
         }
-        if let Some(section) = parse_package_swift(&root.join("Package.swift"))? {
+        if let Some(section) = parse_swift_dependencies(&root)? {
             sections.push(section);
         }
 
@@ -157,6 +157,7 @@ impl PackageUpdateChecker {
             "Maven" => self.maven_latest(package_name).await,
             "Packagist" => self.packagist_latest(package_name).await,
             "RubyGems" => self.rubygems_latest(package_name).await,
+            "SwiftPM" => self.swiftpm_latest(package_name).await,
             _ => Ok(None),
         }?;
 
@@ -277,6 +278,55 @@ impl PackageUpdateChecker {
                 (!prerelease && !is_prerelease_version(version)).then(|| version.to_string())
             })
         }))
+    }
+
+    async fn swiftpm_latest(&self, package_name: &str) -> Result<Option<String>> {
+        // For Swift packages, we need to search GitHub since there's no central registry
+        // First try to find the repository with exact name match
+        let search_url = format!("https://api.github.com/search/repositories?q=\"{}\"+language:Swift&sort=stars&order=desc&per_page=10", package_name);
+        
+        match self.client.get(&search_url).send().await {
+            Ok(response) => {
+                let payload = response.text().await?;
+                if let Ok(json) = serde_json::from_str::<JsonValue>(&payload) {
+                    if let Some(items) = json.get("items").and_then(|i| i.as_array()) {
+                        // Try to find the exact match (case-insensitive)
+                        for item in items {
+                            if let Some(repo_name) = item.get("name").and_then(|n| n.as_str()) {
+                                if repo_name.eq_ignore_ascii_case(package_name) {
+                                    // Try to get the latest release tag
+                                    if let Some(owner) = item.get("owner").and_then(|o| o.get("login")).and_then(|l| l.as_str()) {
+                                        let releases_url = format!("https://api.github.com/repos/{}/{}/releases/latest", owner, repo_name);
+                                        
+                                        if let Ok(releases_response) = self.client.get(&releases_url).send().await {
+                                            let releases_payload = releases_response.text().await?;
+                                            if let Ok(releases_json) = serde_json::from_str::<JsonValue>(&releases_payload) {
+                                                if let Some(tag_name) = releases_json.get("tag_name").and_then(|t| t.as_str()) {
+                                                    // Clean up the tag name (remove 'v' prefix if present)
+                                                    let version = tag_name.trim_start_matches('v').to_string();
+                                                    return Ok(Some(version));
+                                                }
+                                            }
+                                        }
+                                        
+                                        // If no releases found, fall back to default branch
+                                        if let Some(default_branch) = item.get("default_branch").and_then(|b| b.as_str()) {
+                                            return Ok(Some(format!("branch:{}", default_branch)));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                // If GitHub API fails, we can't determine the latest version
+            }
+        }
+        
+        // As a fallback, we can't determine the latest version without a registry
+        Ok(None)
     }
 }
 
@@ -707,27 +757,196 @@ fn parse_gemfile(path: &Path) -> Result<Option<DependencySection>> {
     build_single_group_section(path, "💎", packages)
 }
 
+fn parse_swift_dependencies(root: &Path) -> Result<Option<DependencySection>> {
+    // First try to find and parse Package.resolved files
+    if let Some(resolved_path) = find_package_resolved(root) {
+        if let Some(section) = parse_package_resolved(&resolved_path)? {
+            return Ok(Some(section));
+        }
+    }
+    
+    // Fall back to Package.swift parsing
+    let package_swift_path = root.join("Package.swift");
+    if package_swift_path.exists() {
+        if let Some(section) = parse_package_swift(&package_swift_path)? {
+            return Ok(Some(section));
+        }
+    }
+    
+    Ok(None)
+}
+
+fn find_package_resolved(root: &Path) -> Option<PathBuf> {
+    // Check for standalone SPM package
+    let standalone = root.join("Package.resolved");
+    if standalone.exists() {
+        return Some(standalone);
+    }
+    
+    // Check inside .xcodeproj or .xcworkspace
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.ends_with(".xcodeproj") || name.ends_with(".xcworkspace") {
+                    // Check project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+                    let workspace_path = path.join("project.xcworkspace/xcshareddata/swiftpm/Package.resolved");
+                    if workspace_path.exists() {
+                        return Some(workspace_path);
+                    }
+                    
+                    // Check directly inside workspace for .xcworkspace
+                    if name.ends_with(".xcworkspace") {
+                        let direct = path.join("xcshareddata/swiftpm/Package.resolved");
+                        if direct.exists() {
+                            return Some(direct);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    None
+}
+
+fn parse_package_resolved(path: &Path) -> Result<Option<DependencySection>> {
+    let content = fs::read_to_string(path)?;
+    let json: JsonValue = serde_json::from_str(&content).map_err(|_| anyhow::anyhow!("Failed to parse JSON"))?;
+    
+    let pins = json.get("pins").and_then(|p| p.as_array()).ok_or_else(|| anyhow::anyhow!("No pins found"))?;
+    if pins.is_empty() {
+        return Ok(None);
+    }
+    
+    let mut packages = Vec::new();
+    for pin in pins {
+        // Support both v2/v3 (identity + location) and v1 (package + repositoryURL) formats
+        let identity = pin.get("identity").and_then(|i| i.as_str());
+        let location = pin.get("location").and_then(|l| l.as_str());
+        let repository_url = pin.get("repositoryURL").and_then(|r| r.as_str()); // v1 fallback
+        
+        let url = location.or(repository_url).unwrap_or("");
+        let raw_name = identity.or_else(|| extract_package_name_from_url(url)).unwrap_or("");
+        if raw_name.is_empty() {
+            continue;
+        }
+        
+        // Capitalize first letter to match common conventions
+        let name = if raw_name.is_empty() {
+            "SwiftPackage".to_string()
+        } else {
+            let mut chars = raw_name.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            }
+        };
+        
+        let mut version = "*".to_string();
+        if let Some(state) = pin.get("state").and_then(|s| s.as_object()) {
+            if let Some(v) = state.get("version").and_then(|v| v.as_str()) {
+                version = v.to_string();
+            } else if let Some(b) = state.get("branch").and_then(|b| b.as_str()) {
+                version = format!("branch:{}", b);
+            } else if let Some(r) = state.get("revision").and_then(|r| r.as_str()) {
+                version = format!("rev:{}", &r[..7.min(r.len())]);
+            }
+        }
+        
+        packages.push(PackageDependency {
+            name,
+            version,
+            source: "SwiftPM".to_string(),
+            latest_version: None,
+            is_checking_update: false,
+        });
+    }
+    
+    build_single_group_section(path, "🍎", packages)
+}
+
 fn parse_package_swift(path: &Path) -> Result<Option<DependencySection>> {
     if !path.exists() {
         return Ok(None);
     }
-    let regex = Regex::new(
-        r#"\.package\((?:name:\s*"([^"]+)"\s*,\s*)?(?:url|path):\s*"[^"]+"\s*,\s*(?:from|exact):\s*"([^"]+)""#,
-    )?;
-    let packages = regex
-        .captures_iter(&fs::read_to_string(path)?)
-        .map(|captures| PackageDependency {
-            name: captures
-                .get(1)
-                .map(|name| name.as_str().to_string())
-                .unwrap_or_else(|| "SwiftPackage".to_string()),
-            version: captures[2].to_string(),
-            source: "SwiftPM".to_string(),
-            latest_version: None,
-            is_checking_update: false,
-        })
-        .collect::<Vec<_>>();
+    
+    let content = fs::read_to_string(path)?;
+    
+    // Collapse multi-line declarations by replacing newlines with spaces
+    let collapsed = content.replace('\n', " ");
+    
+    // Match every .package(...) block
+    let package_pattern = r#"\.package\s*\([^)]+\)"#;
+    let regex = Regex::new(package_pattern)?;
+    
+    let mut packages = Vec::new();
+    for captures in regex.captures_iter(&collapsed) {
+        if let Some(block) = captures.get(0) {
+            if let Some((name, version)) = parse_package_dependency_block(block.as_str()) {
+                packages.push(PackageDependency {
+                    name,
+                    version,
+                    source: "SwiftPM".to_string(),
+                    latest_version: None,
+                    is_checking_update: false,
+                });
+            }
+        }
+    }
+    
     build_single_group_section(path, "🍎", packages)
+}
+
+fn parse_package_dependency_block(block: &str) -> Option<(String, String)> {
+    // Extract URL
+    let url_regex = Regex::new(r#"url:\s*"([^"]+)""#).ok()?;
+    let url = if let Some(captures) = url_regex.captures(block) {
+        captures.get(1)?.as_str()
+    } else {
+        return None;
+    };
+    
+    let name = extract_package_name_from_url(url).unwrap_or("SwiftPackage");
+    
+    // Extract version with various patterns
+    let patterns = [
+        (r#"from:\s*"([^"]+)""#, ""),
+        (r#"exact:\s*"([^"]+)""#, ""),
+        (r#"branch:\s*"([^"]+)""#, "branch:"),
+        (r#"revision:\s*"([^"]+)""#, "rev:"),
+    ];
+    
+    for (pattern, prefix) in patterns {
+        if let Ok(regex) = Regex::new(pattern) {
+            if let Some(captures) = regex.captures(block) {
+                let value = captures.get(1)?.as_str();
+                let version = if prefix == "rev:" {
+                    format!("{}{}", prefix, &value[..7.min(value.len())])
+                } else if prefix.is_empty() {
+                    value.to_string()
+                } else {
+                    format!("{}{}", prefix, value)
+                };
+                return Some((name.to_string(), version));
+            }
+        }
+    }
+    
+    Some((name.to_string(), "*".to_string()))
+}
+
+fn extract_package_name_from_url(url: &str) -> Option<&str> {
+    let components: Vec<&str> = url.split('/').collect();
+    if let Some(last) = components.last() {
+        let name = last
+            .trim_end_matches(".git")
+            .trim_end_matches(".package");
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    None
 }
 
 fn build_single_group_section(
