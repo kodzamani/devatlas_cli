@@ -96,6 +96,7 @@ impl ProjectScanner {
                 "proc",
                 "root",
                 "run",
+                "opt",
                 "sbin",
                 "snap",
                 "sys",
